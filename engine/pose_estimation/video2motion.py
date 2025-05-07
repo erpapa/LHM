@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from math import sqrt
 
 current_dir_path = os.path.dirname(__file__)
 sys.path.append(current_dir_path + "/../pose_estimation")
@@ -41,24 +42,41 @@ np.random.seed(seed=0)
 random.seed(0)
 
 
-def load_video(video_path, pad_ratio):
-    cap = cv2.VideoCapture(video_path)
-    assert cap.isOpened(), f"fail to load video file {video_path}"
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
+def load_video(video_path, pad_ratio, max_resolution):
     frames = []
-    while cap.isOpened():
-        flag, frame = cap.read()
-        if not flag:
-            break
+    for i in range(2):
+        cap = cv2.VideoCapture(video_path)
+        assert cap.isOpened(), f"fail to load video file {video_path}"
+        fps = cap.get(cv2.CAP_PROP_FPS)
+    
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        downsample_factor = -1
+        if (height * width) > max_resolution:
+            downsample_factor = sqrt(max_resolution / (height * width))
+            height = int(height * downsample_factor)
+            width = int(width * downsample_factor)
 
-        # since the tracker and detector receive BGR images as inputs
-        # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if pad_ratio > 0:
-            frame, offset_w, offset_h = img_center_padding(frame, pad_ratio)
-        frames.append(frame)
-    height, weight, _ = frames[0].shape
-    return frames, height, weight, fps, offset_w, offset_h
+        
+        offset_w, offset_h = 0, 0
+        while cap.isOpened():
+            flag, frame = cap.read()
+            if not flag:
+                break
+
+            # since the tracker and detector receive BGR images as inputs
+            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if downsample_factor > 0:
+                frame = cv2.resize(
+                    frame,
+                    (width, height),
+                    interpolation=cv2.INTER_AREA,
+                )
+            if pad_ratio > 0:
+                frame, offset_w, offset_h = img_center_padding(frame, pad_ratio)
+            frames.append(frame)
+        height, width, _ = frames[0].shape
+    return frames, height, width, fps, offset_w, offset_h
 
 
 def images_crop(images, bboxes, target_size, device=torch.device("cuda")):
@@ -166,7 +184,6 @@ def empty_frame_pad(pose_results):
     all_is_None = True
     for i in range(1, len(pose_results)):
         if pose_results[i] is None and pose_results[i - 1] is not None:
-            print(i)
             pose_results[i] = copy.deepcopy(pose_results[i - 1])
         if pose_results[i] is not None:
             all_is_None = False
@@ -279,14 +296,16 @@ class Video2MotionPipeline:
     def __init__(
         self,
         model_path,
+        fitting_steps,
         device,
         kp_mode="vitpose",
         visualize=True,
         pad_ratio=0.2,
         fov=60,
     ):
+        self.MAX_RESOLUTION = 1280 * 720
         self.device = device
-        self.visualize = True
+        self.visualize = visualize
         self.kp_mode = kp_mode
         self.pad_ratio = pad_ratio
         self.fov = fov
@@ -296,7 +315,7 @@ class Video2MotionPipeline:
         )
         self.smplx_model.to(self.device)
         self.smplify = TemporalSMPLify(
-            smpl=self.smplx_model, device=self.device, num_steps=50
+            smpl=self.smplx_model, device=self.device, num_steps=fitting_steps
         )
 
     def track(self, all_frames):
@@ -309,6 +328,7 @@ class Video2MotionPipeline:
         max_frame_length = -1
         for _id in tracking_results.keys():
             if len(tracking_results[_id]["frame_id"]) > max_frame_length:
+                max_frame_length = len(tracking_results[_id]["frame_id"])
                 main_character = _id
 
         bboxes = tracking_results[main_character]["bbox"]
@@ -382,8 +402,8 @@ class Video2MotionPipeline:
                 min_cutoff=1.2, beta=0.3, sampling_rate=self.fps, device=self.device
             )
             for i in range(len(data_chunk["keypoints_2d"])):
-                data_chunk["keypoints_2d"][i, :2] = one_euro.filter(
-                    data_chunk["keypoints_2d"][i, :2]
+                data_chunk["keypoints_2d"][i, :, :2] = one_euro.filter(
+                    data_chunk["keypoints_2d"][i, :, :2]
                 )
 
             poses, betas, transl = self.smplify.fit(
@@ -477,10 +497,10 @@ class Video2MotionPipeline:
             with open(os.path.join(out_path, f"{(i+1):05}.json"), "w") as fp:
                 json.dump(smplx_param, fp)
 
-    def __call__(self, video_path, output_path):
+    def __call__(self, video_path, output_path, is_file_only=False):
         start = time.time()
         all_frames, raw_H, raw_W, fps, offset_w, offset_h = load_video(
-            video_path, pad_ratio=self.pad_ratio
+            video_path, pad_ratio=self.pad_ratio, max_resolution=self.MAX_RESOLUTION
         )
         self.fps = fps
         video_length = len(all_frames)
@@ -500,9 +520,12 @@ class Video2MotionPipeline:
             frame_ids, frames, keypoints, bboxes, raw_K, video_length
         )
 
-        output_folder = os.path.join(
-            output_path, video_path.split("/")[-1].split(".")[0]
-        )
+        if is_file_only:
+            output_folder = output_path
+        else:
+            output_folder = os.path.join(
+                output_path, video_path.split("/")[-1].split(".")[0]
+            )
         os.makedirs(output_folder, exist_ok=True)
 
         if self.visualize:
@@ -517,6 +540,8 @@ class Video2MotionPipeline:
         )
         duration = time.time() - start
         print(f"{video_path} processing completed, duration: {duration:.2f}s")
+
+        return smplx_output_folder
 
 
 def get_parse():
@@ -541,6 +566,14 @@ def get_parse():
         default="vitpose",
         help="only ViTPose is supported currently",
     )
+    parser.add_argument(
+        "--fitting_steps",
+        nargs="+",
+        type=int,
+        default=[30, 50],
+        help="Number of iterations for the two-stage fitting in SMPLify",
+    )
+
     parser.add_argument("--visualize", action="store_true")
     args = parser.parse_args()
     return args
@@ -559,6 +592,7 @@ if __name__ == "__main__":
 
     pipeline = Video2MotionPipeline(
         opt.model_path,
+        opt.fitting_steps,
         device,
         kp_mode=opt.kp_mode,
         visualize=opt.visualize,

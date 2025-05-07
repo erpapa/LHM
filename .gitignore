@@ -50,7 +50,6 @@ Thumbs.db
 *.swp
 *.swo
 *.~*
-*.tar
 
 # User Setting
 debug/
@@ -63,6 +62,7 @@ pretrained_models/
 debug_vis/
 pretrained_models
 train_data
-gfpgan
+lhm_cuda_dockers/
+gfpgan/
 nohup.out
 nohup.log
