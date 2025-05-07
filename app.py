@@ -744,7 +744,7 @@ def demo_lhm(pose_estimator, face_detector, parsing_net, lhm, cfg):
         )
 
         demo.queue()
-        demo.launch(server_name="0.0.0.0")
+        demo.launch(server_name="0.0.0.0",share=True)
 
 
 def launch_gradio_app():

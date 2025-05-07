@@ -37,11 +37,11 @@ spaces
 setuptools==74.0.0
 taming_transformers_rom1504==0.0.6
 timm==1.0.15
-torch==2.3.0
-torchvision==0.18.0
+torch==2.4.1
+torchvision==0.19.1
 tqdm==4.66.4
 transformers==4.41.2
 trimesh==4.4.9
 typeguard==2.13.3
 xatlas==0.0.9
-xformers==0.0.26.post1
+xformers==0.0.28.post1
