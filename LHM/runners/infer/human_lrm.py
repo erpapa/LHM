@@ -78,6 +78,15 @@ def avaliable_device():
 
     return device
 
+def scale_intrs(intrs, ratio_x, ratio_y):
+    if len(intrs.shape) >= 3:
+        intrs[:, 0] = intrs[:, 0] * ratio_x
+        intrs[:, 1] = intrs[:, 1] * ratio_y
+    else:
+        intrs[0] = intrs[0] * ratio_x
+        intrs[1] = intrs[1] * ratio_y
+    return intrs
+
 def resize_with_padding(img, target_size, padding_color=(255, 255, 255)):
     target_w, target_h = target_size
     h, w = img.shape[:2]
@@ -622,6 +631,7 @@ class HumanLRMInferrer(Inferrer):
         dump_tmp_dir: str,  # require by extracting motion seq from video, to save some results
         dump_image_dir: str,
         dump_video_path: str,
+        mask_video_path: str,
         shape_param=None,
     ):
 
@@ -738,7 +748,8 @@ class HumanLRMInferrer(Inferrer):
             },
         )
 
-        batch_list = [] 
+        mask_list = []
+        batch_list = []
         batch_size = 40  # avoid memeory out!
 
         for batch_i in range(0, camera_size, batch_size):
@@ -793,20 +804,29 @@ class HumanLRMInferrer(Inferrer):
             batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
             batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
             batch_list.append(batch_rgb)
+            comp_mask = (comp_mask.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
+            mask_list.append(comp_mask)
 
             del res
             torch.cuda.empty_cache()
         
         rgb = np.concatenate(batch_list, axis=0)
-
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
+        mask = np.concatenate(mask_list, axis=0)
 
         print(f"save video to {dump_video_path}")
-
-
+        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
         images_to_video(
             rgb,
             output_path=dump_video_path,
+            fps=render_fps,
+            gradio_codec=False,
+            verbose=True,
+        )
+
+        os.makedirs(os.path.dirname(mask_video_path), exist_ok=True)
+        images_to_video(
+            mask,
+            output_path=mask_video_path,
             fps=render_fps,
             gradio_codec=False,
             verbose=True,
@@ -852,6 +872,12 @@ class HumanLRMInferrer(Inferrer):
                 motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
             )
             motion_name = os.path.basename(motion_name)
+            mask_video_path = os.path.join(
+                self.cfg.video_dump,
+                subdir_path,
+                motion_name,
+                f"{uid}_mask.mp4",
+            )
             dump_video_path = os.path.join(
                 self.cfg.video_dump,
                 subdir_path,
@@ -896,6 +922,7 @@ class HumanLRMInferrer(Inferrer):
                     dump_tmp_dir=dump_tmp_dir,
                     dump_image_dir=dump_image_dir,
                     dump_video_path=dump_video_path,
+                    mask_video_path=mask_video_path,
                     shape_param=shape_pose.beta,
                 )
 
@@ -917,6 +944,7 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
         dump_tmp_dir: str,  # require by extracting motion seq from video, to save some results
         dump_image_dir: str,
         dump_video_path: str,
+        mask_video_path: str,
     ):
         source_size = self.cfg.source_size
         render_size = self.cfg.render_size
@@ -1096,6 +1124,12 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
                 motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
             )
             motion_name = os.path.basename(motion_name)
+            mask_video_path = os.path.join(
+                self.cfg.video_dump.replace("videos", "videos_benchmark"),
+                subdir_path,
+                motion_name,
+                f"{uid}_mask.mp4",
+            )
             dump_video_path = os.path.join(
                 self.cfg.video_dump.replace("videos", "videos_benchmark"),
                 subdir_path,
@@ -1123,4 +1157,5 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
                 dump_tmp_dir=dump_tmp_dir,
                 dump_image_dir=dump_image_dir,
                 dump_video_path=dump_video_path,
+                mask_video_path=mask_video_path,
             )

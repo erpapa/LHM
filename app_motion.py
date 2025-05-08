@@ -24,6 +24,7 @@ import numpy as np
 import spaces
 import torch
 from PIL import Image
+from pathlib import Path
 
 torch._dynamo.config.disable = True
 import argparse
@@ -35,11 +36,13 @@ import subprocess
 import torch
 from accelerate import Accelerator
 from omegaconf import OmegaConf
+from collections import defaultdict
 
 from engine.pose_estimation.pose_estimator import PoseEstimator
 from engine.SegmentAPI.base import Bbox
 from LHM.utils.model_download_utils import AutoModelQuery
 from LHM.utils.model_query_utils import AutoModelSwitcher
+from app_config import AppConfig, AppnInstance
 
 try:
     from engine.SegmentAPI.SAM import SAM2Seg
@@ -88,6 +91,15 @@ def prior_check():
     if not os.path.exists('./pretrained_models'):
         prior_data = MODEL_CARD['prior_model']
         download_extract_tar_from_url(prior_data)
+
+def scale_intrs(intrs, ratio_x, ratio_y):
+    if len(intrs.shape) >= 3:
+        intrs[:, 0] = intrs[:, 0] * ratio_x
+        intrs[:, 1] = intrs[:, 1] * ratio_y
+    else:
+        intrs[0] = intrs[0] * ratio_x
+        intrs[1] = intrs[1] * ratio_y
+    return intrs
 
 def get_bbox(mask):
     height, width = mask.shape
@@ -354,11 +366,16 @@ def init_preprocessor():
     global preprocessor
     preprocessor = Preprocessor()
 
-def preprocess_fn(image_in: np.ndarray, remove_bg: bool, recenter: bool, working_dir):
-    image_raw = os.path.join(working_dir.name, "raw.png")
+def preprocess_fn(image_in: np.ndarray, remove_bg: bool, recenter: bool, working_dir: Path):
+    working_path = None
+    if isinstance(working_dir, Path):
+        working_path = working_dir.absolute()
+    else:
+        working_path = working_dir.name
+    image_raw = os.path.join(working_path, "raw.png")
     with Image.fromarray(image_in) as img:
         img.save(image_raw)
-    image_out = os.path.join(working_dir.name, "rembg.png")
+    image_out = os.path.join(working_path, "rembg.png")
     success = preprocessor.preprocess(image_path=image_raw, save_path=image_out, rmbg=remove_bg, recenter=recenter)
     assert success, f"Failed under preprocess_fn!"
     return image_out
@@ -368,273 +385,311 @@ def get_image_base64(path):
         encoded_string = base64.b64encode(image_file.read()).decode()
     return f"data:image/png;base64,{encoded_string}"
 
+@spaces.GPU(duration=100)
+@torch.no_grad()
+def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path):
+    if config is None:
+        config = AppnInstance.config
+    working_path = None
+    if isinstance(working_dir, Path):
+        working_path = working_dir.absolute()
+    else:
+        working_path = working_dir.name
+    image_raw = os.path.join(working_path, "raw.png")
+    if type(image) == str:
+        shutil.copyfile(image, image_raw)
+    else:
+        with Image.fromarray(image) as img:
+            img.save(image_raw)
+    
+    base_vid = os.path.basename(video_params).split(".")[0]
+    smplx_params_dir = os.path.join("./train_data/motion_video/", base_vid, "smplx_params")
+
+    if not os.path.exists(smplx_params_dir):
+        # user-defined motion video
+
+        motion_processing_dir = './train_data/users/motion_processing'
+        video_hash = get_video_hash(video_params)
+        output_path =  os.path.join(motion_processing_dir, video_hash)
+
+        if not os.path.exists(output_path):
+            # Load motion_generation only when needed
+            print("Loading Video2MotionPipeline...")
+            device = avaliable_device() # Ensure device is available in this scope
+            motion_generation = Video2MotionPipeline(
+                './pretrained_models/human_model_files',
+                fitting_steps=[30, 50],
+                device=device,
+                kp_mode='vitpose',
+                visualize=False,
+                pad_ratio=0.2,
+                fov=60,
+            )
+            print("Generating motion parameters...")
+            smplx_params_dir= motion_generation(video_params, output_path, is_file_only=True)
+            # Unload motion_generation after use
+            print("Unloading Video2MotionPipeline...")
+            del motion_generation
+            torch.cuda.empty_cache()
+            print("Video2MotionPipeline unloaded.")
+        else:
+            smplx_params_dir = os.path.join(output_path, 'smplx_params')
+
+    mask_video_path = os.path.join(working_path, "mask.mp4")
+    dump_video_path = os.path.join(working_path, "output.mp4")
+    dump_image_path = os.path.join(working_path, "output.png")
+
+    # prepare dump paths
+    omit_prefix = os.path.dirname(image_raw)
+    image_name = os.path.basename(image_raw)
+    uid = image_name.split(".")[0]
+    subdir_path = os.path.dirname(image_raw).replace(omit_prefix, "")
+    subdir_path = (
+        subdir_path[1:] if subdir_path.startswith("/") else subdir_path
+    )
+    print("subdir_path and uid:", subdir_path, uid)
+
+    motion_seqs_dir = smplx_params_dir
+    
+    motion_name = os.path.dirname(
+        motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
+    )
+
+    motion_name = os.path.basename(motion_name)
+
+    dump_image_dir = os.path.dirname(dump_image_path)
+    os.makedirs(dump_image_dir, exist_ok=True)
+
+    print(image_raw, motion_seqs_dir, dump_image_dir, dump_video_path)
+
+    dump_tmp_dir = dump_image_dir
+
+
+    source_size = config.cfg.source_size
+    render_size = config.cfg.render_size
+    render_fps = 20
+
+    aspect_standard = 5.0 / 3
+    motion_img_need_mask = config.cfg.get("motion_img_need_mask", False)  # False
+    vis_motion = config.cfg.get("vis_motion", False)  # False
+
+    with torch.no_grad():
+        if config.parsing_net is not None:
+            parsing_out = config.parsing_net(img_path=image_raw, bbox=None)
+            parsing_mask = (parsing_out.masks * 255).astype(np.uint8)
+        else:
+            img_np = cv2.imread(image_raw)
+            remove_np = remove(img_np)
+            parsing_mask = remove_np[...,3]
+
+        shape_pose = config.pose_estimator(image_raw)
+    assert shape_pose.is_full_body, f"The input image is illegal, {shape_pose.msg}"
+
+    # prepare reference image
+    image, _, _ = infer_preprocess_image(
+        image_raw,
+        mask=parsing_mask,
+        intr=None,
+        pad_ratio=0,
+        bg_color=1.0,
+        max_tgt_size=896,
+        aspect_standard=aspect_standard,
+        enlarge_ratio=[1.0, 1.0],
+        render_tgt_size=source_size,
+        multiply=14,
+        need_mask=True,
+    )
+
+    try:
+        rgb = np.array(Image.open(image_raw))[...,:3]  # RGBA input
+        rgb = torch.from_numpy(rgb).permute(2, 0, 1)
+        bbox = config.face_detector.detect_face(rgb)
+        head_rgb = rgb[:, int(bbox[1]) : int(bbox[3]), int(bbox[0]) : int(bbox[2])]
+        head_rgb = head_rgb.permute(1, 2, 0)
+        src_head_rgb = head_rgb.cpu().numpy()
+    except:
+        print("w/o head input!")
+        src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
+
+    # resize to dino size
+    try:
+        src_head_rgb = cv2.resize(
+            src_head_rgb,
+            dsize=(config.cfg.src_head_size, config.cfg.src_head_size),
+            interpolation=cv2.INTER_AREA,
+        )  # resize to dino size
+    except:
+        src_head_rgb = np.zeros(
+            (config.cfg.src_head_size, config.cfg.src_head_size, 3), dtype=np.uint8
+        )
+
+    src_head_rgb = (
+        torch.from_numpy(src_head_rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
+    )  # [1, 3, H, W]
+
+    save_ref_img_path = os.path.join(
+        dump_tmp_dir, "output.png"
+    )
+    vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
+        np.uint8
+    )
+    Image.fromarray(vis_ref_img).save(save_ref_img_path)
+
+    # read motion seq
+    motion_name = os.path.dirname(
+        motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
+    )
+    motion_name = os.path.basename(motion_name)
+
+    motion_seq = prepare_motion_seqs(
+        motion_seqs_dir,
+        None,
+        save_root=dump_tmp_dir,
+        fps=30,
+        bg_color=1.0,
+        aspect_standard=aspect_standard,
+        enlarge_ratio=[1.0, 1, 0],
+        render_image_res=render_size,
+        multiply=16,
+        need_mask=motion_img_need_mask,
+        vis_motion=vis_motion,
+        motion_size=3000,
+    )
+
+    camera_size = len(motion_seq["motion_seqs"])
+    shape_param = shape_pose.beta
+
+    device = "cuda"
+    dtype = torch.float32
+    shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
+
+    config.lhm.to(dtype)
+
+    smplx_params = motion_seq['smplx_params']
+    smplx_params['betas'] = shape_param.to(device)
+
+    gs_model_list, query_points, transform_mat_neutral_pose = config.lhm.infer_single_view(
+        image.unsqueeze(0).to(device, dtype),
+        src_head_rgb.unsqueeze(0).to(device, dtype),
+        None,
+        None,
+        render_c2ws=motion_seq["render_c2ws"].to(device),
+        render_intrs=motion_seq["render_intrs"].to(device),
+        render_bg_colors=motion_seq["render_bg_colors"].to(device),
+        smplx_params={
+            k: v.to(device) for k, v in smplx_params.items()
+        },
+    )
+
+    # rendering !!!!
+    start_time = time.time()
+
+    mask_list = []
+    batch_list = []
+
+    batch_size = 40  # avoid memeory out!
+
+    for batch_i in range(0, camera_size, batch_size):
+        with torch.no_grad():
+            # TODO check device and dtype
+            # dict_keys(['comp_rgb', 'comp_rgb_bg', 'comp_mask', 'comp_depth', '3dgs'])
+
+            print(f"batch: {batch_i}, total: {camera_size //batch_size +1} ")
+
+            keys = [
+                "root_pose",
+                "body_pose",
+                "jaw_pose",
+                "leye_pose",
+                "reye_pose",
+                "lhand_pose",
+                "rhand_pose",
+                "trans",
+                "focal",
+                "princpt",
+                "img_size_wh",
+                "expr",
+            ]
+
+
+            batch_smplx_params = dict()
+            batch_smplx_params["betas"] = shape_param.to(device)
+            batch_smplx_params['transform_mat_neutral_pose'] = transform_mat_neutral_pose
+            for key in keys:
+                batch_smplx_params[key] = motion_seq["smplx_params"][key][
+                    :, batch_i : batch_i + batch_size
+                ].to(device)
+
+            # def animation_infer(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_h, render_w):
+            res = config.lhm.animation_infer(gs_model_list, query_points, batch_smplx_params,
+                render_c2ws=motion_seq["render_c2ws"][
+                    :, batch_i : batch_i + batch_size
+                ].to(device),
+                render_intrs=motion_seq["render_intrs"][
+                    :, batch_i : batch_i + batch_size
+                ].to(device),
+                render_bg_colors=motion_seq["render_bg_colors"][
+                    :, batch_i : batch_i + batch_size
+                ].to(device),
+                )
+
+        comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
+        comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
+        comp_mask[comp_mask < 0.5] = 0.0
+
+        batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
+        batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
+        batch_list.append(batch_rgb)
+        comp_mask = (comp_mask.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
+        mask_list.append(comp_mask)
+
+        del res
+        torch.cuda.empty_cache()
+    
+    rgb = np.concatenate(batch_list, axis=0)
+    mask = np.concatenate(mask_list, axis=0)
+    print(f"time elapsed: {time.time() - start_time}")
+
+    if vis_motion:
+        # print(rgb.shape, motion_seq["vis_motion_render"].shape)
+
+        vis_ref_img = np.tile(
+            cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]))[
+                None, :, :, :
+            ],
+            (rgb.shape[0], 1, 1, 1),
+        )
+        rgb = np.concatenate(
+            [rgb, motion_seq["vis_motion_render"], vis_ref_img], axis=2
+        )
+
+    os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
+    images_to_video(
+        rgb,
+        output_path=dump_video_path,
+        fps=render_fps,
+        gradio_codec=False,
+        verbose=True,
+    )
+
+    os.makedirs(os.path.dirname(mask_video_path), exist_ok=True)
+    images_to_video(
+        mask,
+        output_path=mask_video_path,
+        fps=render_fps,
+        gradio_codec=False,
+        verbose=True,
+    )
+
+    return dump_image_path, dump_video_path, mask_video_path
 
 @torch.no_grad()
-def demo_lhm(pose_estimator, face_detector, parsing_net, lhm, motion_generation, cfg):
+def create_demo(config: AppConfig):
 
     motion_processing_dir = './train_data/users/motion_processing'
     if os.path.exists(motion_processing_dir):
         shutil.rmtree(motion_processing_dir)
     os.makedirs(motion_processing_dir, exist_ok=True)
-
-
-    @spaces.GPU(duration=100)
-    def core_fn(image: str, video_params, working_dir):
-        image_raw = os.path.join(working_dir.name, "raw.png")
-        with Image.fromarray(image) as img:
-            img.save(image_raw)
-        
-        
-        base_vid = os.path.basename(video_params).split(".")[0]
-        smplx_params_dir = os.path.join("./train_data/motion_video/", base_vid, "smplx_params")
-
-        if not os.path.exists(smplx_params_dir):
-            # user-defined motion video
-
-            motion_processing_dir = './train_data/users/motion_processing'
-            video_hash = get_video_hash(video_params)
-            output_path =  os.path.join(motion_processing_dir, video_hash)
-
-            if not os.path.exists(output_path):
-                smplx_params_dir= motion_generation(video_params, output_path, is_file_only=True)
-            else:
-                smplx_params_dir = os.path.join(output_path, 'smplx_params')
-
-        dump_video_path = os.path.join(working_dir.name, "output.mp4")
-        dump_image_path = os.path.join(working_dir.name, "output.png")
-
-        # prepare dump paths
-        omit_prefix = os.path.dirname(image_raw)
-        image_name = os.path.basename(image_raw)
-        uid = image_name.split(".")[0]
-        subdir_path = os.path.dirname(image_raw).replace(omit_prefix, "")
-        subdir_path = (
-            subdir_path[1:] if subdir_path.startswith("/") else subdir_path
-        )
-        print("subdir_path and uid:", subdir_path, uid)
-
-        motion_seqs_dir = smplx_params_dir
-        
-        motion_name = os.path.dirname(
-            motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-        )
-
-        motion_name = os.path.basename(motion_name)
-
-        dump_image_dir = os.path.dirname(dump_image_path)
-        os.makedirs(dump_image_dir, exist_ok=True)
-
-        print(image_raw, motion_seqs_dir, dump_image_dir, dump_video_path)
-
-        dump_tmp_dir = dump_image_dir
-
-
-        source_size = cfg.source_size
-        render_size = cfg.render_size
-        render_fps = 30
-
-        aspect_standard = 5.0 / 3
-        motion_img_need_mask = cfg.get("motion_img_need_mask", False)  # False
-        vis_motion = cfg.get("vis_motion", False)  # False
-
-        with torch.no_grad():
-            if parsing_net is not None:
-                parsing_out = parsing_net(img_path=image_raw, bbox=None)
-                parsing_mask = (parsing_out.masks * 255).astype(np.uint8)
-            else:
-                img_np = cv2.imread(image_raw)
-                remove_np = remove(img_np)
-                parsing_mask = remove_np[...,3]
-
-            shape_pose = pose_estimator(image_raw)
-        assert shape_pose.is_full_body, f"The input image is illegal, {shape_pose.msg}"
-
-        # prepare reference image
-        image, _, _ = infer_preprocess_image(
-            image_raw,
-            mask=parsing_mask,
-            intr=None,
-            pad_ratio=0,
-            bg_color=1.0,
-            max_tgt_size=896,
-            aspect_standard=aspect_standard,
-            enlarge_ratio=[1.0, 1.0],
-            render_tgt_size=source_size,
-            multiply=14,
-            need_mask=True,
-        )
-
-        try:
-            rgb = np.array(Image.open(image_raw))[...,:3]  # RGBA input
-            rgb = torch.from_numpy(rgb).permute(2, 0, 1)
-            bbox = face_detector.detect_face(rgb)
-            head_rgb = rgb[:, int(bbox[1]) : int(bbox[3]), int(bbox[0]) : int(bbox[2])]
-            head_rgb = head_rgb.permute(1, 2, 0)
-            src_head_rgb = head_rgb.cpu().numpy()
-        except:
-            print("w/o head input!")
-            src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
-
-        # resize to dino size
-        try:
-            src_head_rgb = cv2.resize(
-                src_head_rgb,
-                dsize=(cfg.src_head_size, cfg.src_head_size),
-                interpolation=cv2.INTER_AREA,
-            )  # resize to dino size
-        except:
-            src_head_rgb = np.zeros(
-                (cfg.src_head_size, cfg.src_head_size, 3), dtype=np.uint8
-            )
-
-        src_head_rgb = (
-            torch.from_numpy(src_head_rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
-        )  # [1, 3, H, W]
-
-        save_ref_img_path = os.path.join(
-            dump_tmp_dir, "output.png"
-        )
-        vis_ref_img = (image[0].permute(1, 2, 0).cpu().detach().numpy() * 255).astype(
-            np.uint8
-        )
-        Image.fromarray(vis_ref_img).save(save_ref_img_path)
-
-        # read motion seq
-        motion_name = os.path.dirname(
-            motion_seqs_dir[:-1] if motion_seqs_dir[-1] == "/" else motion_seqs_dir
-        )
-        motion_name = os.path.basename(motion_name)
-
-        motion_seq = prepare_motion_seqs(
-            motion_seqs_dir,
-            None,
-            save_root=dump_tmp_dir,
-            fps=30,
-            bg_color=1.0,
-            aspect_standard=aspect_standard,
-            enlarge_ratio=[1.0, 1, 0],
-            render_image_res=render_size,
-            multiply=16,
-            need_mask=motion_img_need_mask,
-            vis_motion=vis_motion,
-            motion_size=3000,
-        )
-
-        camera_size = len(motion_seq["motion_seqs"])
-        shape_param = shape_pose.beta
-
-        device = "cuda"
-        dtype = torch.float32
-        shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
-
-        lhm.to(dtype)
-
-        smplx_params = motion_seq['smplx_params']
-        smplx_params['betas'] = shape_param.to(device)
-
-        gs_model_list, query_points, transform_mat_neutral_pose = lhm.infer_single_view(
-            image.unsqueeze(0).to(device, dtype),
-            src_head_rgb.unsqueeze(0).to(device, dtype),
-            None,
-            None,
-            render_c2ws=motion_seq["render_c2ws"].to(device),
-            render_intrs=motion_seq["render_intrs"].to(device),
-            render_bg_colors=motion_seq["render_bg_colors"].to(device),
-            smplx_params={
-                k: v.to(device) for k, v in smplx_params.items()
-            },
-        )
-
-        # rendering !!!!
-        start_time = time.time()
-
-        batch_list = [] 
-
-        batch_size = 40  # avoid memeory out!
-
-        for batch_i in range(0, camera_size, batch_size):
-            with torch.no_grad():
-                # TODO check device and dtype
-                # dict_keys(['comp_rgb', 'comp_rgb_bg', 'comp_mask', 'comp_depth', '3dgs'])
-
-                print(f"batch: {batch_i}, total: {camera_size //batch_size +1} ")
-
-                keys = [
-                    "root_pose",
-                    "body_pose",
-                    "jaw_pose",
-                    "leye_pose",
-                    "reye_pose",
-                    "lhand_pose",
-                    "rhand_pose",
-                    "trans",
-                    "focal",
-                    "princpt",
-                    "img_size_wh",
-                    "expr",
-                ]
-
-
-                batch_smplx_params = dict()
-                batch_smplx_params["betas"] = shape_param.to(device)
-                batch_smplx_params['transform_mat_neutral_pose'] = transform_mat_neutral_pose
-                for key in keys:
-                    batch_smplx_params[key] = motion_seq["smplx_params"][key][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device)
-
-                # def animation_infer(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_h, render_w):
-                res = lhm.animation_infer(gs_model_list, query_points, batch_smplx_params,
-                    render_c2ws=motion_seq["render_c2ws"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    render_intrs=motion_seq["render_intrs"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    render_bg_colors=motion_seq["render_bg_colors"][
-                        :, batch_i : batch_i + batch_size
-                    ].to(device),
-                    )
-
-            comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
-            comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
-            comp_mask[comp_mask < 0.5] = 0.0
-
-            batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
-            batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
-            batch_list.append(batch_rgb)
-
-            del res
-            torch.cuda.empty_cache()
-        
-        rgb = np.concatenate(batch_list, axis=0)
-        print(f"time elapsed: {time.time() - start_time}")
-
-        if vis_motion:
-            # print(rgb.shape, motion_seq["vis_motion_render"].shape)
-
-            vis_ref_img = np.tile(
-                cv2.resize(vis_ref_img, (rgb[0].shape[1], rgb[0].shape[0]))[
-                    None, :, :, :
-                ],
-                (rgb.shape[0], 1, 1, 1),
-            )
-            rgb = np.concatenate(
-                [rgb, motion_seq["vis_motion_render"], vis_ref_img], axis=2
-            )
-
-        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
-
-        images_to_video(
-            rgb,
-            output_path=dump_video_path,
-            fps=render_fps,
-            gradio_codec=False,
-            verbose=True,
-        )
-
-
-        return dump_image_path, dump_video_path
 
     _TITLE = '''LHM: Large Animatable Human Model'''
 
@@ -733,12 +788,19 @@ def demo_lhm(pose_estimator, face_detector, parsing_net, lhm, motion_generation,
                         with gr.Row():
                             output_video = gr.Video(label="Rendered Video", format="mp4", height=480, width=270, autoplay=True)
 
+            with gr.Column(variant='panel', scale=1):
+                with gr.Tabs(elem_id="openlrm_mask_video"):
+                    with gr.TabItem('Mask Video'):
+                        with gr.Row():
+                            mask_video = gr.Video(label="Mask Video", format="mp4", height=480, width=270, autoplay=True)
+
         # SETTING
         with gr.Row():
             with gr.Column(variant='panel', scale=1):
                 submit = gr.Button('Generate', elem_id="openlrm_generate", variant='primary')
 
 
+        demo_config = gr.State()
         working_dir = gr.State()
         submit.click(
             fn=assert_input_image,
@@ -750,29 +812,17 @@ def demo_lhm(pose_estimator, face_detector, parsing_net, lhm, motion_generation,
             queue=False,
         ).success(
             fn=core_fn,
-            inputs=[input_image, video_input, working_dir], # video_params refer to smpl dir
-            outputs=[processed_image, output_video],
+            inputs=[demo_config, input_image, video_input, working_dir], # video_params refer to smpl dir
+            outputs=[processed_image, output_video, mask_video],
         )
 
-        demo.queue()
-        demo.launch(server_name="0.0.0.0")
+        return demo
 
-def get_parse():
-    import argparse
-    parser = argparse.ArgumentParser(description='LHM-gradio: Large Animatable Human Model')
-    parser.add_argument('--model_name', default='LHM-1B-HF', type=str, choices=['LHM-500M', 'LHM-1B', 'LHM-500M-HF', 'LHM-1B-HF', "LHM-MINI"], help='Model name')
-    args = parser.parse_args()
-    return args
-
-
-def launch_gradio_app():
-
-    args = get_parse()
-
-    model_name = args.model_name
+def create_demo_config(model_name='LHM-1B-HF'):
     model_switcher = AutoModelSwitcher(MEMORY_MODEL_CARD, extra_memory=6000)
-    model_name =  model_switcher.query(model_name)
+    model_name = model_switcher.query(model_name)
 
+    print(f"Using specified model: {model_name}") # Add a print statement to confirm
 
     os.environ.update({
         "APP_ENABLED": "1",
@@ -783,27 +833,16 @@ def launch_gradio_app():
 
     prior_check()
 
-
     # video pose estimator
     download_geo_files()
 
-    device= avaliable_device()
+    device = avaliable_device()
 
-    motion_generation = Video2MotionPipeline(
-        './pretrained_models/human_model_files',
-        fitting_steps=[30, 50],
-        device=device,
-        kp_mode='vitpose',
-        visualize=False,
-        pad_ratio=0.2,
-        fov=60,
-    )
-
-    facedetector = VGGHeadDetector(
+    face_detector = VGGHeadDetector(
         "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
         device=device,
     )
-    facedetector.to(device)
+    face_detector.to(device)
 
     pose_estimator = PoseEstimator(
         "./pretrained_models/human_model_files/", device='cpu'
@@ -811,9 +850,9 @@ def launch_gradio_app():
     pose_estimator.to(device)
     pose_estimator.device = device 
     try:
-        parsingnet = SAM2Seg()
+        parsing_net = SAM2Seg()
     except: 
-        parsingnet = None
+        parsing_net = None
 
     accelerator = Accelerator()
 
@@ -821,12 +860,26 @@ def launch_gradio_app():
     lhm = _build_model(cfg)
     lhm.to('cuda')
 
-    demo_lhm(pose_estimator, facedetector, parsingnet, lhm, motion_generation, cfg)
+    config = AppConfig.create(pose_estimator, face_detector, parsing_net, lhm, cfg)
+    return config
+
+def get_parse():
+    import argparse
+    parser = argparse.ArgumentParser(description='LHM-gradio: Large Animatable Human Model')
+    parser.add_argument('--model_name', default='LHM-1B-HF', type=str, choices=['LHM-500M', 'LHM-1B', 'LHM-500M-HF', 'LHM-1B-HF', "LHM-MINI"], help='Model name')
+    args = parser.parse_args()
+    return args
+
+def launch_gradio_app():
+    args = get_parse()
+    model_name = args.model_name
+    config = create_demo_config(model_name)
+    demo = create_demo(config)
+    demo.queue()
+    demo.launch(server_name="0.0.0.0", share=True)
 
     # cfg, cfg_train = parse_configs()
     # demo_lhm(None, None, None, None, cfg)
-
-
 
 if __name__ == '__main__':
     launch_gradio_app()
