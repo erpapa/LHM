@@ -833,7 +833,7 @@ def launch_gradio_app():
     config = create_demo_config(model_name)
     demo = create_demo(config)
     demo.queue()
-    demo.launch(server_name="0.0.0.0", share=True)
+    demo.launch(server_name="0.0.0.0")
 
     # cfg, cfg_train = parse_configs()
     # demo_lhm(None, None, None, None, cfg)
