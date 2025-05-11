@@ -34,22 +34,23 @@ def task_status(task_id: str):
     status = app.state.task_status.get(task_id, 0)
     result = app.state.task_result.get(task_id, None)
     data = {"task_id": task_id, "status": status}
-    if status == 3 and result is not None:
+    if status == 4 and result is not None:
         data["output_image_path"] = result.get("output_image_path", "")
         data["output_video_path"] = result.get("output_video_path", "")
         data["mask_video_path"] = result.get("mask_video_path", "")
     return {"state": 200, "msg": "ok", "data": data}
 
 # 0: 没有找到这个任务
-# 1: 任务进行中
-# 2: 任务失败
-# 3: 任务完成
+# 1: 任务排队中
+# 2: 任务进行中
+# 3: 任务失败
+# 4: 任务完成
 @app.get("/task/status/{task_id}")
 def task_status(task_id: str):
     status = app.state.task_status.get(task_id, 0)
     result = app.state.task_result.get(task_id, None)
     data = {"task_id": task_id, "status": status}
-    if status == 3 and result is not None:
+    if status == 4 and result is not None:
         data["output_image_path"] = result.get("output_image_path", "")
         data["output_video_path"] = result.get("output_video_path", "")
         data["mask_video_path"] = result.get("mask_video_path", "")
@@ -67,8 +68,10 @@ def inference(
         return {"state": 500, "msg": "image_url is null"}
     # 生成task_id
     task_id = generate_task_id(f'{motion_name}_{image_url}')
+    task_status = 1
+    app.state.task_status.set(task_id, task_status)
     background_tasks.add_task(execute_core_fn, task_id, motion_name, image_url)
-    return {"state": 200, "msg": "already add task", "data": {"task_id": task_id}}
+    return {"state": 200, "msg": "already add task", "data": {"task_id": task_id, "status": task_status}}
 
 def generate_task_id(string):
     task_id = hashlib.md5(string.encode('utf8')).hexdigest()
@@ -91,9 +94,7 @@ def clear_working_dir(task_id: str):
     if len(task_id) == 0:
         return
     try:
-        result = app.state.task_result.get(task_id, None)
-        if result is not None:
-            app.state.task_result.remove(task_id)
+        app.state.task_status.remove(task_id)
         working_dir = get_working_dir(task_id)
         if working_dir.exists() and working_dir.is_dir():
             shutil.rmtree(working_dir)
@@ -101,15 +102,15 @@ def clear_working_dir(task_id: str):
         print(f'clean working_dir failed: {e}')
 
 def clear_task_if_needed():
-    if len(app.state.task_status) > 100:
-        result_dict = app.state.task_status.dequeue()
+    if len(app.state.task_result) > 100:
+        result_dict = app.state.task_result.dequeue()
         task_id = None if len(result_dict.keys()) == 0 else list(result_dict.keys())[0]
         clear_working_dir(task_id)
 
 def execute_core_fn(task_id: str, motion_name: str, image_url: str):
     task_result = None
     task_msg = 'ok'
-    task_status = 1
+    task_status = 2
     app.state.task_status.set(task_id, task_status)
     try:
         motion_dir = get_motion_dir()
@@ -135,15 +136,15 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
             'mask_video_path': str(Path(mask_video_path).relative_to(project_dir))
         }
         app.state.task_result.set(task_id, task_result)
-        task_status = 3
+        task_status = 4
         task_msg = 'generate video success'
         print('execute core_fn success, result: ', task_result)
     except AssertionError as e:
-        task_status = 2
+        task_status = 3
         task_msg = str(e) # The input image is illegal (表示没有检测到人体，后端可根据该字符串判断)
         print(f'execute core_fn failed: {task_msg}')
     except Exception as e:
-        task_status = 2
+        task_status = 3
         task_msg = str(e)
         print(f'execute core_fn failed: {task_msg}')
     
@@ -156,7 +157,7 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
         "status": task_status,
         "msg": task_msg
     }
-    if task_status == 3 and task_result is not None:
+    if task_status == 4 and task_result is not None:
         json_data["output_image_path"] = task_result.get("output_image_path", "")
         json_data["output_video_path"] = task_result.get("output_video_path", "")
         json_data["mask_video_path"] = task_result.get("mask_video_path", "")
