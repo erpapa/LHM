@@ -59,13 +59,21 @@ from LHM.utils.ffmpeg_utils import images_to_video
 from LHM.utils.hf_hub import wrap_model_hub
 from LHM.utils.model_card import MEMORY_MODEL_CARD, MODEL_CARD, MODEL_CONFIG
 from LHM.utils.model_query_utils import AutoModelSwitcher
-from app_config import AppConfig, AppnInstance
+from app_config import AppConfig, AppInstance
 
 
 def download_geo_files():
     if not os.path.exists('./pretrained_models/dense_sample_points/1_20000.ply'):
         download_from_url('https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/data/LHM/1_20000.ply','./pretrained_models/dense_sample_points/')
 
+def avaliable_device():
+    if torch.cuda.is_available():
+        current_device_id = torch.cuda.current_device()
+        device = f"cuda:{current_device_id}"
+    else:
+        device = "cpu"
+
+    return device
 
 def query_model_config(model_name):
     try:
@@ -379,12 +387,12 @@ def get_image_base64(path):
 
 @spaces.GPU(duration=100)
 @torch.no_grad()
-def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path):
+def core_fn(image: str, video_params: str, working_dir: Path, config: AppConfig):
     if config is None:
-        config = AppnInstance.config
+        config = AppInstance.config
     working_path = None
     if isinstance(working_dir, Path):
-        working_path = working_dir.absolute()
+        working_path = working_dir.resolve()
     else:
         working_path = working_dir.name
     image_raw = os.path.join(working_path, "raw.png")
@@ -435,6 +443,15 @@ def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path)
     motion_img_need_mask = config.cfg.get("motion_img_need_mask", False)  # False
     vis_motion = config.cfg.get("vis_motion", False)  # False
 
+    device = avaliable_device()
+    if config.pose_estimator is None:
+        # --- On-demand PoseEstimator loading and execution ---
+        print("Loading PoseEstimator...")
+        config.pose_estimator = PoseEstimator(
+            "./pretrained_models/human_model_files/", device='cpu' # Load to CPU first potentially? Or directly to device? Let's use device.
+        )
+        config.pose_estimator.to(device)
+        config.pose_estimator.device = device
     with torch.no_grad():
         if config.parsing_net is not None:
             parsing_out = config.parsing_net(img_path=image_raw, bbox=None)
@@ -445,7 +462,16 @@ def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path)
             parsing_mask = remove_np[...,3]
 
         shape_pose = config.pose_estimator(image_raw)
-    assert shape_pose.is_full_body, f"The input image is illegal, {shape_pose.msg}"
+    # Unload PoseEstimator
+    shape_param_beta = shape_pose.beta # Store the result before deleting
+    is_full_body = shape_pose.is_full_body # Store result
+    shape_pose_msg = shape_pose.msg # Store result
+    del shape_pose # Delete intermediate variable too
+    # del config.pose_estimator
+    # config.pose_estimator = None
+    torch.cuda.empty_cache()
+
+    assert is_full_body, f"The input image is illegal, {shape_pose_msg}"
 
     # prepare reference image
     image, _, _ = infer_preprocess_image(
@@ -463,12 +489,22 @@ def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path)
     )
 
     try:
-        rgb = np.array(Image.open(image_raw))[...,:3]  # RGBA input
-        rgb = torch.from_numpy(rgb).permute(2, 0, 1)
-        bbox = config.face_detector.detect_face(rgb)
-        head_rgb = rgb[:, int(bbox[1]) : int(bbox[3]), int(bbox[0]) : int(bbox[2])]
+        if config.face_detector is None:
+            print("Loading VGGHeadDetector...")
+            config.face_detector = VGGHeadDetector(
+                "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
+                device=device,
+            )
+            print("VGGHeadDetector loaded.")
+
+        rgb_face = np.array(Image.open(image_raw))[...,:3]  # RGBA input
+        rgb_face = torch.from_numpy(rgb_face).permute(2, 0, 1).to(device) # Move tensor to device
+        bbox = config.face_detector.detect_face(rgb_face)
+        head_rgb = rgb_face[:, int(bbox[1]) : int(bbox[3]), int(bbox[0]) : int(bbox[2])]
         head_rgb = head_rgb.permute(1, 2, 0)
         src_head_rgb = head_rgb.cpu().numpy()
+        del rgb_face # Delete intermediate tensor
+        del head_rgb # Delete intermediate tensor
     except:
         print("w/o head input!")
         src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
@@ -519,11 +555,11 @@ def core_fn(config: AppConfig, image: str, video_params: str, working_dir: Path)
     )
 
     camera_size = len(motion_seq["motion_seqs"])
-    shape_param = shape_pose.beta
+    # shape_param = shape_pose.beta # Use the stored value
 
     device = "cuda"
     dtype = torch.float32
-    shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
+    shape_param = torch.tensor(shape_param_beta, dtype=dtype).unsqueeze(0)
 
     config.lhm.to(dtype)
 
@@ -757,7 +793,7 @@ def create_demo(config: AppConfig):
             with gr.Column(variant='panel', scale=1):
                 submit = gr.Button('Generate', elem_id="openlrm_generate", variant='primary')
 
-        AppnInstance.config = config
+        AppInstance.config = config
         demo_config = gr.State()
         working_dir = gr.State()
         submit.click(
@@ -770,7 +806,7 @@ def create_demo(config: AppConfig):
             queue=False,
         ).success(
             fn=core_fn,
-            inputs=[demo_config, input_image, video_input, working_dir], # video_params refer to smpl dir
+            inputs=[input_image, video_input, working_dir, demo_config], # video_params refer to smpl dir
             outputs=[processed_image, output_video, mask_video],
         )
 
@@ -795,23 +831,23 @@ def create_demo_config(model_name='LHM-1B-HF'):
     # video pose estimator
     download_geo_files()
 
+    device = avaliable_device()
+    accelerator = Accelerator() # 初始化后，自动处理设备分配
+
     face_detector = VGGHeadDetector(
         "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
-        device='cuda',
+        device=device,
     )
-    face_detector.to('cuda')
 
     pose_estimator = PoseEstimator(
         "./pretrained_models/human_model_files/", device='cpu'
     )
-    pose_estimator.to('cuda')
-    pose_estimator.device = 'cuda'
+    pose_estimator.to(device)
+    pose_estimator.device = device
     try:
         parsing_net = SAM2Seg()
     except: 
         parsing_net = None
-
-    accelerator = Accelerator()
 
     cfg, cfg_train = parse_configs()
     lhm = _build_model(cfg)
