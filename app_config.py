@@ -17,7 +17,7 @@ class AppConfig(object):
         self.parsing_net = parsing_net
         self.lhm = lhm
         self.cfg = cfg
-    
+
     @staticmethod
     def create(pose_estimator, face_detector, parsing_net, lhm, cfg):
         config = AppConfig(pose_estimator, face_detector, parsing_net, lhm, cfg)
@@ -27,9 +27,10 @@ class AppDict(object):
     def __init__(self, capacity=10000):
         super(AppDict, self).__init__()
         self.capacity = capacity
+        self.iter_index = 0
         self.list = []
         self.dict = {}
-    
+
     def __getitem__(self, key):
         return self.get(key)
 
@@ -44,6 +45,17 @@ class AppDict(object):
 
     def __str__(self):
         return str(self.dict)
+
+    def __iter__(self):
+        self.iter_index = 0
+        return self
+
+    def __next__(self):
+        if self.iter_index >= len(self.list):
+            raise StopIteration
+        key = self.list[self.iter_index]
+        value = self.dict.get(key, None)
+        return key, value
 
     def get(self, key: str): 
         return self.dict.get(key)
@@ -67,15 +79,15 @@ class AppDict(object):
         val = self.dict.pop(key)
         return {key: val}
 
-    def count(self):
-        return len(self.dict)
-    
     def remove(self, key: str):
         if key in self.list:
             del self.list[self.list.index(key)]
         if key in self.dict:
             del self.dict[key]
-    
+
+    def count(self):
+        return len(self.list)
+
     def clear(self):
         self.list.clear()
         self.dict.clear()

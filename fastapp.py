@@ -26,20 +26,21 @@ def download_file(task_id: str, file_name: str):
     return FileResponse(path=file_path, filename=file_name)
 
 # 获取当前任务状态
-@app.get("/task/id")
-def task_status(task_id: str):
+@app.get("/task/status")
+def current_task_status():
     task_id = app.state.task_id
     if task_id is None:
-        return {"state": 200, "msg": "ok", "data": {"task_id": None, "status": 0}}
+        return {"state": 200, "msg": "ok", "data": {"task_id": None, "status": 0, "waiting_num": 0}}
     status = app.state.task_status.get(task_id, 0)
     result = app.state.task_result.get(task_id, None)
-    data = {"task_id": task_id, "status": status}
+    data = {"task_id": task_id, "status": status, "waiting_num": 0}
     if status == 4 and result is not None:
         data["output_image_path"] = result.get("output_image_path", "")
         data["output_video_path"] = result.get("output_video_path", "")
         data["mask_video_path"] = result.get("mask_video_path", "")
     return {"state": 200, "msg": "ok", "data": data}
 
+# 查询task_id的任务状态
 # 0: 没有找到这个任务
 # 1: 任务排队中
 # 2: 任务进行中
@@ -49,11 +50,24 @@ def task_status(task_id: str):
 def task_status(task_id: str):
     status = app.state.task_status.get(task_id, 0)
     result = app.state.task_result.get(task_id, None)
-    data = {"task_id": task_id, "status": status}
+    data = {"task_id": task_id, "status": status, "waiting_num": get_waiting_num(task_id)}
+    # 如果是任务完成，返回结果
     if status == 4 and result is not None:
         data["output_image_path"] = result.get("output_image_path", "")
         data["output_video_path"] = result.get("output_video_path", "")
         data["mask_video_path"] = result.get("mask_video_path", "")
+    return {"state": 200, "msg": "ok", "data": data}
+
+# 删除推理任务
+@app.get("/task/remove/{task_id}")
+def task_remove(task_id: str):
+    status = app.state.task_status.get(task_id, 0)
+    data = {"task_id": task_id, "status": status, "waiting_num": get_waiting_num(task_id)}
+    # 删除任务
+    app.state.task_status.remove(task_id)
+    # 如果任务已完成，删除工作目录
+    if status == 4:
+        clear_working_dir(task_id)
     return {"state": 200, "msg": "ok", "data": data}
 
 # 执行推理任务，生成视频
@@ -68,10 +82,11 @@ def inference(
         return {"state": 500, "msg": "image_url is null"}
     # 生成task_id
     task_id = generate_task_id(f'{motion_name}_{image_url}')
-    task_status = 1
+    task_status = 1 # 等待处理
     app.state.task_status.set(task_id, task_status)
     background_tasks.add_task(execute_core_fn, task_id, motion_name, image_url)
-    return {"state": 200, "msg": "already add task", "data": {"task_id": task_id, "status": task_status}}
+    data = {"task_id": task_id, "status": task_status, "waiting_num": get_waiting_num(task_id)}
+    return {"state": 200, "msg": "already add task", "data": data}
 
 def generate_task_id(string):
     task_id = hashlib.md5(string.encode('utf8')).hexdigest()
@@ -88,6 +103,23 @@ def get_working_dir(task_id: str):
     working_dir = get_project_dir() / 'exps' / 'works' / task_id
     return working_dir
 
+def get_waiting_num(task_id: str):
+    num = 0
+    if task_id is None:
+        return num
+    if len(task_id) == 0:
+        return num
+    task_status = app.state.task_status
+    status = task_status.get(task_id, 0)
+    if status != 1:
+        return num
+    for k, v in task_status:
+        if k == task_id:
+            break
+        if v == 1:
+            num += 1
+    return num
+
 def clear_working_dir(task_id: str):
     if task_id is None:
         return
@@ -102,16 +134,21 @@ def clear_working_dir(task_id: str):
         print(f'clean working_dir failed: {e}')
 
 def clear_task_if_needed():
-    if len(app.state.task_result) > 100:
+    if len(app.state.task_result) > 20:
         result_dict = app.state.task_result.dequeue()
         task_id = None if len(result_dict.keys()) == 0 else list(result_dict.keys())[0]
         clear_working_dir(task_id)
 
 def execute_core_fn(task_id: str, motion_name: str, image_url: str):
-    task_result = None
-    task_msg = 'ok'
+    task_status = app.state.task_status.get(task_id, 0)
+    # 已删除的任务直接返回
+    if task_status == 0:
+        return
+    # 更新任务状态为执行中
     task_status = 2
     app.state.task_status.set(task_id, task_status)
+    task_result = None
+    task_msg = 'ok'
     try:
         motion_dir = get_motion_dir()
         motion_path = os.path.join(motion_dir, motion_name)
@@ -155,7 +192,8 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
     json_data = {
         "task_id": task_id,
         "status": task_status,
-        "msg": task_msg
+        "task_msg": task_msg,
+        "waiting_num": 0
     }
     if task_status == 4 and task_result is not None:
         json_data["output_image_path"] = task_result.get("output_image_path", "")
