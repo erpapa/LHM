@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from LHM.utils.download_utils import download_from_url
 from app import create_demo_config, create_demo, core_fn
 from app_config import AppDict
- 
+
 app = FastAPI()
 
 # 检查接口是否可用
@@ -22,12 +22,12 @@ def hello():
 @app.get("/exps/works/{task_id}/{file_name}")
 def download_file(task_id: str, file_name: str):
     working_dir = get_working_dir(task_id)
-    file_path = os.path.join(working_dir, task_id, file_name)
-    return FileResponse(path=file_path, filename=file_name)
+    file_path = os.path.join(working_dir, file_name)
+    return FileResponse(path=file_path, media_type="application/octet-stream", filename=file_name)
 
 # 获取当前任务状态
 @app.get("/task/status")
-def current_task_status():
+def current_status():
     task_id = app.state.task_id
     if task_id is None:
         return {"state": 200, "msg": "ok", "data": {"task_id": None, "status": 0, "waiting_num": 0}}
@@ -82,6 +82,7 @@ def inference(
         return {"state": 500, "msg": "image_url is null"}
     # 生成task_id
     task_id = generate_task_id(f'{motion_name}_{image_url}')
+    print('inference generate task_id: ', task_id)
     task_status = 1 # 等待处理
     app.state.task_status.set(task_id, task_status)
     background_tasks.add_task(execute_core_fn, task_id, motion_name, image_url)
@@ -165,7 +166,7 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
         # 执行视频生成任务
         app.state.task_id = task_id
         app.state.working_dir = working_dir
-        output_image_path, output_video_path, mask_video_path = core_fn(image_path, motion_path, app.state.c, app.state.demo_config)
+        output_image_path, output_video_path, mask_video_path = core_fn(image_path, motion_path, app.state.working_dir, app.state.demo_config)
         project_dir = get_project_dir()
         task_result = {
             'output_image_path': str(Path(output_image_path).relative_to(project_dir)), 
@@ -199,21 +200,24 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
         json_data["output_image_path"] = task_result.get("output_image_path", "")
         json_data["output_video_path"] = task_result.get("output_video_path", "")
         json_data["mask_video_path"] = task_result.get("mask_video_path", "")
-    
-    print("POST: https://api.example.com/task/complete, json=", json_data)
-    response = requests.post("https://api.example.com/task/complete", json=json_data)
-    print("Response: ", response)
+    try:
+        print("requests post: https://api.example.com/task/complete, json=", json_data)
+        response = requests.post("https://api.example.com/task/complete", json=json_data)
+        print("requests post response: ", response)
+    except Exception as e:
+        print(f"requests post failed: {e}")
     # app.state.task_id = None
     # app.state.working_dir = None
     # 清理之前的任务空间
     clear_task_if_needed()
 
 if __name__ == '__main__':
-    demo_config = create_demo_config('LHM-1B-HF')
-    app.state.demo_config = demo_config
+    app.state.task_id = None
+    app.state.working_dir = None
     app.state.task_status = AppDict(capacity=100)
     app.state.task_result = AppDict(capacity=100)
-    demo = create_demo(demo_config)
+    app.state.demo_config = create_demo_config('LHM-1B-HF')
+    demo = create_demo(app.state.demo_config)
     gr.mount_gradio_app(app, demo, path='/gradio')
     uvicorn.run(app, host='0.0.0.0', port=8000)
  

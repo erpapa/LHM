@@ -55,6 +55,7 @@ class AppDict(object):
             raise StopIteration
         key = self.list[self.iter_index]
         value = self.dict.get(key, None)
+        self.iter_index += 1
         return key, value
 
     def get(self, key: str): 
@@ -64,9 +65,9 @@ class AppDict(object):
         return self.dict.get(key, default)
     
     def set(self, key: str, value: any):
-        self.list.append(value)
+        self.list.append(key)
         self.dict[key] = value
-        if self.len() > self.capacity:
+        if self.count() > self.capacity:
             self.dequeue()
 
     def enqueue(self, key: str, value: any):
