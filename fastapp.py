@@ -75,7 +75,8 @@ def task_remove(task_id: str):
 def inference(
     background_tasks: BackgroundTasks,
     motion_name: str = Body(None),
-    image_url: str = Body(None)):
+    image_url: str = Body(None),
+    callback_url: str = Body(None)):
     if motion_name is None:
         return {"state": 500, "msg": "motion_name is null"}
     if image_url is None:
@@ -85,7 +86,7 @@ def inference(
     print('inference generate task_id: ', task_id)
     task_status = 1 # 等待处理
     app.state.task_status.set(task_id, task_status)
-    background_tasks.add_task(execute_core_fn, task_id, motion_name, image_url)
+    background_tasks.add_task(execute_core_fn, task_id, motion_name, image_url, callback_url)
     data = {"task_id": task_id, "status": task_status, "waiting_num": get_waiting_num(task_id)}
     return {"state": 200, "msg": "already add task", "data": data}
 
@@ -140,7 +141,7 @@ def clear_task_if_needed():
         task_id = None if len(result_dict.keys()) == 0 else list(result_dict.keys())[0]
         clear_working_dir(task_id)
 
-def execute_core_fn(task_id: str, motion_name: str, image_url: str):
+def execute_core_fn(task_id: str, motion_name: str, image_url: str, callback_url: str):
     task_status = app.state.task_status.get(task_id, 0)
     # 已删除的任务直接返回
     if task_status == 0:
@@ -201,9 +202,10 @@ def execute_core_fn(task_id: str, motion_name: str, image_url: str):
         json_data["output_video_path"] = task_result.get("output_video_path", "")
         json_data["mask_video_path"] = task_result.get("mask_video_path", "")
     try:
-        print("requests post: https://api.example.com/task/complete, json=", json_data)
-        response = requests.post("https://api.example.com/task/complete", json=json_data)
-        print("requests post response: ", response)
+        if callback_url is not None and len(callback_url) > 0:
+            print(f"requests post: {callback_url}, json: ", json_data)
+            response = requests.post(callback_url, json=json_data)
+            print(f"requests post: {callback_url}, response: ", response)
     except Exception as e:
         print(f"requests post failed: {e}")
     # app.state.task_id = None
