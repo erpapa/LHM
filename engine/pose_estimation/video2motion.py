@@ -20,6 +20,7 @@ import os
 import random
 import sys
 import time
+import shutil
 
 import cv2
 import numpy as np
@@ -546,7 +547,8 @@ class Video2MotionPipeline:
 
 def get_parse():
     parser = argparse.ArgumentParser(description="")
-    parser.add_argument("--video_path", type=str, required=True)
+    parser.add_argument("--video_dir", type=str, required=False)
+    parser.add_argument("--video_path", type=str, required=False)
     parser.add_argument("--output_path", type=str, default="./train_data/custom_motion")
     parser.add_argument(
         "--model_path",
@@ -599,4 +601,16 @@ if __name__ == "__main__":
         pad_ratio=opt.pad_ratio,
         fov=FOV,
     )
-    pipeline(opt.video_path, opt.output_path)
+    if opt.video_path:
+        smplx_output_folder = pipeline(opt.video_path, opt.output_path)
+        output_video_path = os.path.join(os.path.dirname(smplx_output_folder), opt.video_path.split("/")[-1])
+        shutil.copyfile(opt.video_path, output_video_path)
+    elif opt.video_dir:
+        for file_path in os.listdir(opt.video_dir):
+            if file_path.lower().endswith('.mp4'):
+                video_path = os.path.join(opt.video_dir, file_path)
+                smplx_output_folder = pipeline(video_path, opt.output_path)
+                output_video_path = os.path.join(os.path.dirname(smplx_output_folder), file_path.split("/")[-1])
+                shutil.copyfile(video_path, output_video_path)
+    else:
+        raise ValueError("Please specify the video path or directory")
