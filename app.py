@@ -633,11 +633,12 @@ def core_fn(image: str, video_params: str, working_dir: Path, config: AppConfig)
 
         comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
         comp_mask = res["comp_mask"] # [Nv, H, W, 3], 0-1
-        comp_mask[comp_mask < 0.5] = 0.0
 
         batch_rgb = comp_rgb * comp_mask + (1 - comp_mask) * 1
         batch_rgb = (batch_rgb.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
         batch_list.append(batch_rgb)
+
+        comp_mask[comp_mask < 0.8] = 0.0
         comp_mask = (comp_mask.clamp(0,1) * 255).to(torch.uint8).detach().cpu().numpy()
         mask_list.append(comp_mask)
 
