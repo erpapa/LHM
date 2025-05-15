@@ -36,7 +36,7 @@ def smplx_gs_smooth(poses, betas, transl, fps=30):
         gaussian_filter_1d(
             poses.view(N, 1, -1).permute(2, 1, 0),
             kernel_size=9,
-            sigma=1 * fps / 30,
+            sigma=1 * fps / 20,
         )
         .permute(2, 1, 0)
         .view(N, J, -1)
@@ -45,7 +45,7 @@ def smplx_gs_smooth(poses, betas, transl, fps=30):
         gaussian_filter_1d(
             betas.view(-1, 1, 10).permute(2, 1, 0),
             kernel_size=11,
-            sigma=5.0 * fps / 30,
+            sigma=5.0 * fps / 20,
         )
         .permute(2, 1, 0)
         .view(-1, 10)
@@ -54,7 +54,7 @@ def smplx_gs_smooth(poses, betas, transl, fps=30):
         gaussian_filter_1d(
             transl.view(N, 1, -1).permute(2, 1, 0),
             kernel_size=9,
-            sigma=1.0 * fps / 30,
+            sigma=1.0 * fps / 20,
         )
         .permute(2, 1, 0)
         .view(N, -1)[1:-1]
@@ -69,7 +69,7 @@ class OneEuroFilter:
     #   realtime v2m: min_cutoff=1.0, beta=1.5
     #   motionshop 2d keypoint: min_cutoff=1.7, beta=0.3
     def __init__(
-        self, min_cutoff=1.0, beta=0.0, sampling_rate=30, d_cutoff=1.0, device="cuda"
+        self, min_cutoff=1.0, beta=0.0, sampling_rate=20, d_cutoff=1.0, device="cuda"
     ):
         self.min_cutoff = min_cutoff
         self.beta = beta

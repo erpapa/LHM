@@ -573,7 +573,7 @@ def core_fn(image: str, video_params: str, working_dir: Path, config: AppConfig)
         motion_seqs_dir,
         None,
         save_root=dump_tmp_dir,
-        fps=30,
+        fps=20,
         bg_color=1.0,
         aspect_standard=aspect_standard,
         enlarge_ratio=[1.0, 1, 0],

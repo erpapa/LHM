@@ -45,38 +45,37 @@ random.seed(0)
 
 def load_video(video_path, pad_ratio, max_resolution):
     frames = []
-    for i in range(2):
-        cap = cv2.VideoCapture(video_path)
-        assert cap.isOpened(), f"fail to load video file {video_path}"
-        fps = cap.get(cv2.CAP_PROP_FPS)
+    cap = cv2.VideoCapture(video_path)
+    assert cap.isOpened(), f"fail to load video file {video_path}"
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    downsample_factor = -1
+    if (height * width) > max_resolution:
+        downsample_factor = sqrt(max_resolution / (height * width))
+        height = int(height * downsample_factor)
+        width = int(width * downsample_factor)
+
     
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        downsample_factor = -1
-        if (height * width) > max_resolution:
-            downsample_factor = sqrt(max_resolution / (height * width))
-            height = int(height * downsample_factor)
-            width = int(width * downsample_factor)
+    offset_w, offset_h = 0, 0
+    while cap.isOpened():
+        flag, frame = cap.read()
+        if not flag:
+            break
 
-        
-        offset_w, offset_h = 0, 0
-        while cap.isOpened():
-            flag, frame = cap.read()
-            if not flag:
-                break
-
-            # since the tracker and detector receive BGR images as inputs
-            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if downsample_factor > 0:
-                frame = cv2.resize(
-                    frame,
-                    (width, height),
-                    interpolation=cv2.INTER_AREA,
-                )
-            if pad_ratio > 0:
-                frame, offset_w, offset_h = img_center_padding(frame, pad_ratio)
-            frames.append(frame)
-        height, width, _ = frames[0].shape
+        # since the tracker and detector receive BGR images as inputs
+        # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if downsample_factor > 0:
+            frame = cv2.resize(
+                frame,
+                (width, height),
+                interpolation=cv2.INTER_AREA,
+            )
+        if pad_ratio > 0:
+            frame, offset_w, offset_h = img_center_padding(frame, pad_ratio)
+        frames.append(frame)
+    height, width, _ = frames[0].shape
     return frames, height, width, fps, offset_w, offset_h
 
 
@@ -505,6 +504,7 @@ class Video2MotionPipeline:
         )
         self.fps = fps
         video_length = len(all_frames)
+        print(f'{video_path} fps: {fps}, video_length: {video_length}')
 
         raw_K = get_camera_parameters(
             max(raw_H, raw_W), fov=self.fov, p_x=None, p_y=None, device=self.device
@@ -513,6 +513,7 @@ class Video2MotionPipeline:
         raw_K[..., 1, -1] = raw_H / 2
 
         bboxes, frame_ids, frames = self.track(all_frames)
+        print(f'{video_path} frame_ids: {frame_ids}, frames_length: {len(frames)}')
         bboxes, keypoints = self.detect_keypoint2d(bboxes, frames)
         gc.collect()
         torch.cuda.empty_cache()

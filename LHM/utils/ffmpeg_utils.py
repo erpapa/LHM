@@ -38,7 +38,7 @@ def encodeffmpeg(inputs, frame_rate, output, format="png"):
     os.system(cmd)
     print("video done!")
 
-def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False, bitrate="10M"):
+def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False, bitrate="5M"):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     frames = []
     for i in range(images.shape[0]):
@@ -56,7 +56,7 @@ def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False,
     iio.imwrite(output_path,frames,fps=fps,codec="libx264",pixelformat="yuv420p",bitrate=bitrate,macro_block_size=16)
 
 
-# def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False, bitrate="10M", batch_size=500):
+# def images_to_video(images, output_path, fps, gradio_codec: bool, verbose=False, bitrate="5M", batch_size=500):
 #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 #     temp_files = []
     
