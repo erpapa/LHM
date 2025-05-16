@@ -45,5 +45,6 @@ trimesh==4.4.9
 typeguard==2.13.3
 xatlas==0.0.9
 xformers==0.0.28.post1
+requests==2.32.3
 fastapi==0.112.4
 uvicorn==0.34.0
